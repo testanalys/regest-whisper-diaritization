@@ -24,5 +24,5 @@ jobs:
 
       - name: Build and Push
         run: |
-          cog build -t ${{ secrets.DOCKERHUB_USERNAME }}/whisper-diarization:latest
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/whisper-diarization:latest
+              cog build -t ${{ secrets.DOCKERHUB_USERNAME }}/whisper-diarization:${{ github.sha }}
+              docker push ${{ secrets.DOCKERHUB_USERNAME }}/whisper-diarization:${{ github.sha }}
