@@ -33,7 +33,7 @@ Audio transcribing + diarization pipeline.
 - `num_speakers: int`: Number of speakers. Leave empty to autodetect. Must be between 1 and 50.
 - `translate: bool`: Translate the speech into English.
 - `language: str`: Language of the spoken words as a language code like 'en'. Leave empty to auto detect language.
-- `prompt: str`: Vocabulary: provide names, acronyms, and loanwords in a list. Use punctuation for best accuracy. Also now used as 'hotwords' paramater in transcribing,
+- `prompt: str`: Vocabulary: provide names, acronyms, and loanwords in a list. Use punctuation for best accuracy. Also now used as 'hotwords' paramater in transcribing.
 
 ### Output
 
