@@ -15,7 +15,7 @@ from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 import torchaudio
 from faster_whisper.vad import VadOptions
-
+from huggingface_hub import login
 
 class Output(BaseModel):
     segments: list
@@ -33,9 +33,9 @@ class Predictor(BasePredictor):
             device="cuda",
             compute_type="float16",
         )
+        login(token=os.getenv('HUGGING_FACE_HUB_TOKEN'))
         self.diarization_model = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=os.getenv('HUGGING_FACE_HUB_TOKEN'),
+            "pyannote/speaker-diarization-3.1"
         ).to(torch.device("cuda"))
 
     def predict(
