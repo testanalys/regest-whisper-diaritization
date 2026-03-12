@@ -1,4 +1,3 @@
-# Prediction interface for Cog ⚙️
 import base64
 import datetime
 import subprocess
@@ -7,8 +6,6 @@ import requests
 import time
 import torch
 import re
-import pandas as pd
-import numpy as np
 
 from cog import BasePredictor, BaseModel, Input, Path
 from faster_whisper import WhisperModel
@@ -22,340 +19,192 @@ class Output(BaseModel):
     language: str = None
     num_speakers: int = None
 
-
 class Predictor(BasePredictor):
-
     def setup(self):
-        """Load the model into memory to make running multiple predictions efficient"""
+        # PERFORMANCE: Enable TF32 for 4090 (Ada Lovelace) hardware acceleration
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
         model_name = "large-v3-turbo"
         self.model = WhisperModel(
             model_name,
             device="cuda",
             compute_type="float16",
         )
-        login(token=os.getenv('HUGGING_FACE_HUB_TOKEN'))
+        
+        hf_token = os.getenv('HUGGING_FACE_HUB_TOKEN')
+        if hf_token:
+            login(token=hf_token)
+        
         self.diarization_model = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1"
         ).to(torch.device("cuda"))
 
     def predict(
         self,
-        file_string: str = Input(
-            description="Either provide: Base64 encoded audio file,", default=None
-        ),
-        file_url: str = Input(
-            description="Or provide: A direct audio file URL", default=None
-        ),
-        file: Path = Input(description="Or an audio file", default=None),
-        num_speakers: int = Input(
-            description="Number of speakers, leave empty to autodetect.",
-            ge=1,
-            le=50,
-            default=None,
-        ),
-        translate: bool = Input(
-            description="Translate the speech into English.",
-            default=False,
-        ),
-        language: str = Input(
-            description="Language of the spoken words as a language code like 'en'. Leave empty to auto detect language.",
-            default=None,
-        ),
-        prompt: str = Input(
-            description="Vocabulary: provide names, acronyms and loanwords in a list. Use punctuation for best accuracy.",
-            default=None,
-        ),
+        file_string: str = Input(description="Base64 encoded audio", default=None),
+        file_url: str = Input(description="Direct audio URL", default=None),
+        file: Path = Input(description="Audio file", default=None),
+        num_speakers: int = Input(description="Number of speakers (1-50)", ge=1, le=50, default=None),
+        translate: bool = Input(description="Translate to English", default=False),
+        language: str = Input(description="Language code (e.g. 'en')", default=None),
+        prompt: str = Input(description="Vocabulary/hotwords", default=None),
     ) -> Output:
-        """Run a single prediction on the model"""
-        # Check if either filestring, filepath or file is provided, but only 1 of them
-        """ if sum([file_string is not None, file_url is not None, file is not None]) != 1:
-            raise RuntimeError("Provide either file_string, file or file_url") """
+        temp_wav_filename = f"temp-{time.time_ns()}.wav"
+        temp_audio_filename = None
 
         try:
-            # Generate a temporary filename
-            temp_wav_filename = f"temp-{time.time_ns()}.wav"
-
-            if file is not None:
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-i",
-                        file,
-                        "-ar",
-                        "16000",
-                        "-ac",
-                        "1",
-                        "-c:a",
-                        "pcm_s16le",
-                        temp_wav_filename,
-                    ]
-                )
-
-            elif file_url is not None:
+            # 1. AUDIO DOWNLOAD/PREP
+            if file:
+                input_path = str(file)
+            elif file_url:
                 response = requests.get(file_url)
                 temp_audio_filename = f"temp-{time.time_ns()}.audio"
-                with open(temp_audio_filename, "wb") as file:
-                    file.write(response.content)
-
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-i",
-                        temp_audio_filename,
-                        "-ar",
-                        "16000",
-                        "-ac",
-                        "1",
-                        "-c:a",
-                        "pcm_s16le",
-                        temp_wav_filename,
-                    ]
-                )
-
-                if os.path.exists(temp_audio_filename):
-                    os.remove(temp_audio_filename)
-            elif file_string is not None:
-                audio_data = base64.b64decode(
-                    file_string.split(",")[1] if "," in file_string else file_string
-                )
+                with open(temp_audio_filename, "wb") as f:
+                    f.write(response.content)
+                input_path = temp_audio_filename
+            elif file_string:
+                audio_data = base64.b64decode(file_string.split(",")[1] if "," in file_string else file_string)
                 temp_audio_filename = f"temp-{time.time_ns()}.audio"
                 with open(temp_audio_filename, "wb") as f:
                     f.write(audio_data)
+                input_path = temp_audio_filename
+            else:
+                raise ValueError("No audio input provided.")
 
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-i",
-                        temp_audio_filename,
-                        "-ar",
-                        "16000",
-                        "-ac",
-                        "1",
-                        "-c:a",
-                        "pcm_s16le",
-                        temp_wav_filename,
-                    ]
-                )
+            # FFmpeg conversion to 16k mono wav (required for Whisper/Pyannote)
+            subprocess.run([
+                "ffmpeg", "-i", input_path, "-ar", "16000", "-ac", "1",
+                "-c:a", "pcm_s16le", temp_wav_filename, "-y"
+            ], check=True, capture_output=True)
 
-                if os.path.exists(temp_audio_filename):
-                    os.remove(temp_audio_filename)
-
-            segments, detected_num_speakers, detected_language = self.speech_to_text(
-                temp_wav_filename,
-                num_speakers,
-                prompt,
-                language,
-                translate=translate,
+            # 2. INFERENCE
+            segments, detected_speakers, detected_lang = self.speech_to_text(
+                temp_wav_filename, num_speakers, prompt, language, translate
             )
 
-            print(f"done with inference")
-            # Return the results as a JSON object
             return Output(
                 segments=segments,
-                language=detected_language,
-                num_speakers=detected_num_speakers,
+                language=detected_lang,
+                num_speakers=detected_speakers,
             )
 
-        except Exception as e:
-            raise RuntimeError("Error Running inference with local model", e)
-
         finally:
-            # Clean up
-            if os.path.exists(temp_wav_filename):
-                os.remove(temp_wav_filename)
+            for f in [temp_wav_filename, temp_audio_filename]:
+                if f and os.path.exists(f):
+                    os.remove(f)
 
-    def convert_time(self, secs, offset_seconds=0):
-        return datetime.timedelta(seconds=(round(secs) + offset_seconds))
-
-    def speech_to_text(
-        self,
-        audio_file_wav,
-        num_speakers=None,
-        prompt="",
-        language=None,
-        translate=False,
-    ):
-        time_start = time.time()
-
-        # Transcribe audio
-        print("Starting transcribing")
+    def speech_to_text(self, audio_path, num_speakers, prompt, language, translate):
+        # TRANSCRIPTION
+        # beam_size=1 is the secret sauce for the Turbo model's speed
         options = dict(
             language=language,
-            beam_size=5,
+            beam_size=1, 
             vad_filter=True,
             vad_parameters=VadOptions(
-                max_speech_duration_s=self.model.feature_extractor.chunk_length,
+                max_speech_duration_s=30,
                 min_speech_duration_ms=100,
                 speech_pad_ms=100,
                 threshold=0.25,
-                neg_threshold=0.2,
             ),
             word_timestamps=True,
             initial_prompt=prompt,
-            language_detection_segments=1,
             task="translate" if translate else "transcribe",
         )
-        segments, transcript_info = self.model.transcribe(audio_file_wav, **options)
-        segments = list(segments)
-        segments = [
-            {
-                "avg_logprob": s.avg_logprob,
-                "start": float(s.start),
-                "end": float(s.end),
-                "text": s.text,
-                "words": [
-                    {
-                        "start": float(w.start),
-                        "end": float(w.end),
-                        "word": w.word,
-                        "probability": w.probability,
-                    }
-                    for w in s.words
-                ],
-            }
-            for s in segments
-        ]
+        
+        t_start = time.time()
+        whisper_segments, info = self.model.transcribe(audio_path, **options)
+        whisper_segments = list(whisper_segments)
+        t_transcribe = time.time() - t_start
 
-        time_transcribing_end = time.time()
-        print(
-            f"Finished with transcribing, took {time_transcribing_end - time_start:.5} seconds, {len(segments)} segments"
-        )
+        # DIARIZATION
+        waveform, sample_rate = torchaudio.load(audio_path)
+        diarization = self.diarization_model({"waveform": waveform, "sample_rate": sample_rate}, num_speakers=num_speakers)
+        t_diarize = time.time() - (t_start + t_transcribe)
 
-        print("Starting diarization")
-        waveform, sample_rate = torchaudio.load(audio_file_wav)
-        diarization = self.diarization_model(
-            {"waveform": waveform, "sample_rate": sample_rate},
-            num_speakers=num_speakers,
-        )
-
-        time_diraization_end = time.time()
-        print(
-            f"Finished with diarization, took {time_diraization_end - time_transcribing_end:.5} seconds"
-        )
-
-        print("Starting merging")
-
-        # Convert diarization list to DataFrame
-        diarize_segments = []
-        diarization_list = list(diarization.itertracks(yield_label=True))
-
-        for turn, _, speaker in diarization_list:
-            diarize_segments.append(
-                {"start": turn.start, "end": turn.end, "speaker": speaker}
-            )
-        diarize_df = pd.DataFrame(diarize_segments)
-        unique_speakers = {speaker for _, _, speaker in diarization_list}
-        detected_num_speakers = len(unique_speakers)
-
-        # Process each segment and its words
+        # 3. LINEAR MERGE (O(N) Complexity - No Pandas!)
+        # Flatten diarization into a sorted list of speaker turns
+        diar_turns = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            diar_turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
+        
+        unique_speakers = len(set(d["speaker"] for d in diar_turns))
+        
         final_segments = []
-        for segment in segments:
-            # Calculate intersection for segment-level speaker assignment
-            diarize_df["intersection"] = np.minimum(
-                diarize_df["end"], segment["end"]
-            ) - np.maximum(diarize_df["start"], segment["start"])
-            diarize_df["union"] = np.maximum(
-                diarize_df["end"], segment["end"]
-            ) - np.minimum(diarize_df["start"], segment["start"])
+        diar_idx = 0
 
-            # Get speaker with maximum intersection
-            dia_tmp = diarize_df[diarize_df["intersection"] > 0]
-            if len(dia_tmp) > 0:
-                speaker = (
-                    dia_tmp.groupby("speaker")["intersection"]
-                    .sum()
-                    .sort_values(ascending=False)
-                    .index[0]
-                )
+        for s in whisper_segments:
+            seg_start, seg_end = s.start, s.end
+            
+            # Find the best speaker via maximum overlap
+            best_speaker = "UNKNOWN"
+            max_overlap = 0
+            
+            # Fast-forward diarization index to current segment start
+            while diar_idx < len(diar_turns) and diar_turns[diar_idx]["end"] < seg_start:
+                diar_idx += 1
+            
+            # Check all turns that intersect with this segment
+            curr_idx = diar_idx
+            while curr_idx < len(diar_turns) and diar_turns[curr_idx]["start"] < seg_end:
+                overlap = min(seg_end, diar_turns[curr_idx]["end"]) - max(seg_start, diar_turns[curr_idx]["start"])
+                if overlap > max_overlap:
+                    max_overlap = overlap
+                    best_speaker = diar_turns[curr_idx]["speaker"]
+                curr_idx += 1
+
+            # Build words list
+            words_list = []
+            for w in (s.words or []):
+                words_list.append({
+                    "start": float(w.start),
+                    "end": float(w.end),
+                    "word": w.word,
+                    "probability": float(w.probability),
+                    "speaker": best_speaker # Segment-level is usually enough for words
+                })
+
+            final_segments.append({
+                "start": float(seg_start),
+                "end": float(seg_end),
+                "text": s.text.strip(),
+                "speaker": best_speaker,
+                "avg_logprob": float(s.avg_logprob),
+                "words": words_list
+            })
+
+        # 4. SMART GROUPING
+        if not final_segments:
+            return [], 0, info.language
+
+        grouped = []
+        current = final_segments[0]
+        end_punctuation = r"[.!?]$"
+
+        for i in range(1, len(final_segments)):
+            next_seg = final_segments[i]
+            gap = next_seg["start"] - current["end"]
+            duration = current["end"] - current["start"]
+
+            # Merge if same speaker, small gap, and not a full sentence yet
+            if (next_seg["speaker"] == current["speaker"] and 
+                gap <= 1.0 and 
+                duration < 25.0 and 
+                not re.search(end_punctuation, current["text"])):
+                
+                current["end"] = next_seg["end"]
+                current["text"] += " " + next_seg["text"]
+                current["words"].extend(next_seg["words"])
             else:
-                speaker = "UNKNOWN"
+                grouped.append(current)
+                current = next_seg
+        
+        grouped.append(current)
+        
+        # Cleanup final text strings
+        for g in grouped:
+            g["text"] = re.sub(r"\s+", " ", g["text"]).strip()
+            g["duration"] = g["end"] - g["start"]
 
-            # Process words if they exist
-            words_with_speakers = []
-            for word in segment["words"]:
-                # Calculate intersection for word-level speaker assignment
-                diarize_df["intersection"] = np.minimum(
-                    diarize_df["end"], word["end"]
-                ) - np.maximum(diarize_df["start"], word["start"])
-                diarize_df["union"] = np.maximum(
-                    diarize_df["end"], word["end"]
-                ) - np.minimum(diarize_df["start"], word["start"])
-
-                # Get speaker with maximum intersection
-                dia_tmp = diarize_df[diarize_df["intersection"] > 0]
-                if len(dia_tmp) > 0:
-                    word_speaker = (
-                        dia_tmp.groupby("speaker")["intersection"]
-                        .sum()
-                        .sort_values(ascending=False)
-                        .index[0]
-                    )
-                else:
-                    word_speaker = (
-                        speaker  # Fall back to segment speaker if no intersection
-                    )
-
-                word["speaker"] = word_speaker
-                words_with_speakers.append(word)
-
-            # Create new segment with speaker information
-            new_segment = {
-                "start": segment["start"],
-                "end": segment["end"],
-                "text": segment["text"],
-                "speaker": speaker,
-                "avg_logprob": segment["avg_logprob"],
-                "words": words_with_speakers,
-            }
-            final_segments.append(new_segment)
-
-        # Smart grouping of segments
-        if len(final_segments) > 0:
-            grouped_segments = []
-            current_group = final_segments[0].copy()
-            sentence_end_pattern = r"[.!?]+"
-
-            for segment in final_segments[1:]:
-                time_gap = segment["start"] - current_group["end"]
-                current_duration = current_group["end"] - current_group["start"]
-
-                # Conditions for combining segments:
-                # 1. Same speaker
-                # 2. Time gap is reasonable (≤ 1 second)
-                # 3. Current group doesn't end with sentence-ending punctuation
-                # 4. Combined duration would not exceed 30 seconds
-                can_combine = (
-                    segment["speaker"] == current_group["speaker"]
-                    and time_gap <= 1.0
-                    and current_duration < 30.0
-                    and not re.search(sentence_end_pattern, current_group["text"][-1:])
-                )
-
-                if can_combine:
-                    # Merge segments
-                    current_group["end"] = segment["end"]
-                    current_group["text"] += " " + segment["text"]
-                    current_group["words"].extend(segment["words"])
-                else:
-                    # Start new group
-                    grouped_segments.append(current_group)
-                    current_group = segment.copy()
-
-            grouped_segments.append(current_group)
-            final_segments = grouped_segments
-
-        # Final cleanup of text
-        for segment in final_segments:
-            # Remove extra spaces
-            segment["text"] = re.sub(r"\s+", " ", segment["text"]).strip()
-            # Ensure proper spacing around punctuation
-            segment["text"] = re.sub(r"\s+([.,!?])", r"\1", segment["text"])
-            # Calculate segment duration
-            segment["duration"] = segment["end"] - segment["start"]
-
-        time_merging_end = time.time()
-        print(
-            f"Finished with merging, took {time_merging_end - time_diraization_end:.5} seconds"
-        )
-
-        return final_segments, detected_num_speakers, transcript_info.language
+        print(f"Transcribe: {t_transcribe:.2f}s | Diarize: {t_diarize:.2f}s | Total: {time.time()-t_start:.2f}s")
+        return grouped, unique_speakers, info.language
