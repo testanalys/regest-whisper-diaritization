@@ -1,6 +1,6 @@
 torch==2.3.1
 requests
-pyannote.audio>=3.3.1
+pyannote.audio==3.3.1
 faster-whisper==1.1.1
 ctranslate2==4.5.0
 torchvision>=0.15.2
@@ -8,3 +8,4 @@ torchtext>=0.15.2
 numpy==1.26.4
 tenacity
 pandas
+huggingface_hub==0.23.4
