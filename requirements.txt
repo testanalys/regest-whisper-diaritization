@@ -9,3 +9,4 @@ numpy==1.26.4
 tenacity
 pandas
 huggingface_hub==0.23.4
+runpod
