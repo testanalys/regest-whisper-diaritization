@@ -8,7 +8,7 @@ import torch
 import re
 
 from cog import BasePredictor, BaseModel, Input, Path
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 from pyannote.audio import Pipeline
 import torchaudio
 from faster_whisper.vad import VadOptions
@@ -26,11 +26,12 @@ class Predictor(BasePredictor):
         torch.backends.cudnn.allow_tf32 = True
         
         model_name = "large-v3-turbo"
-        self.model = WhisperModel(
+        model = WhisperModel(
             model_name,
             device="cuda",
-            compute_type="float16",
+            compute_type="int8_float16",
         )
+        self.model = BatchedInferencePipeline(model=model)
         
         hf_token = os.getenv('HUGGING_FACE_HUB_TOKEN')
         if hf_token:
@@ -100,13 +101,14 @@ class Predictor(BasePredictor):
         options = dict(
             language=language,
             beam_size=1, 
+            batch_size=16,
             vad_filter=True,
-            vad_parameters=VadOptions(
-                max_speech_duration_s=30,
-                min_speech_duration_ms=100,
-                speech_pad_ms=100,
-                threshold=0.25,
-            ),
+            # vad_parameters=VadOptions(
+            #     max_speech_duration_s=30,
+            #     min_speech_duration_ms=100,
+            #     speech_pad_ms=100,
+            #     threshold=0.25,
+            # ),
             word_timestamps=True,
             initial_prompt=prompt,
             task="translate" if translate else "transcribe",
