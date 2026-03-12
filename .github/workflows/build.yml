@@ -9,11 +9,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Install Cog
         run: |
-          curl -o /usr/local/bin/cog -L https://github.com/replicate/cog/releases/latest/download/cog_linux_amd64
-          chmod +x /usr/local/bin/cog
+          sudo curl -o /usr/local/bin/cog -L "https://github.com/replicate/cog/releases/latest/download/cog_Linux_x86_64"
+          sudo chmod +x /usr/local/bin/cog
+          cog --version
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -22,4 +23,6 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and Push
-        run: cog build -t ${{ secrets.DOCKERHUB_USERNAME }}/whisper-diarization:latest && docker push ${{ secrets.DOCKERHUB_USERNAME }}/whisper-diarization:latest
+        run: |
+          cog build -t ${{ secrets.DOCKERHUB_USERNAME }}/whisper-diarization:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/whisper-diarization:latest
