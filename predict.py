@@ -195,7 +195,7 @@ class Predictor(BasePredictor):
 
         # 4. SMART GROUPING
         if not final_segments:
-            return [], 0, info.language
+            return [], 0, info.language, {}
 
         grouped = []
         current = final_segments[0]
