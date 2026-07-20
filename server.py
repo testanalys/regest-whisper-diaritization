@@ -14,6 +14,8 @@ API_KEY = (os.getenv("TRANSCRIPTION_API_KEY") or "").strip()
 
 _predictor = None
 _predictor_lock = threading.Lock()
+# One GPU job per replica — avoids VRAM races when ACA scales concurrent HTTP requests.
+_gpu_semaphore = threading.Semaphore(1)
 
 
 def _get_predictor():
@@ -61,22 +63,23 @@ def _check_auth(authorization: str | None) -> None:
 
 
 def _run_predict(inp: TranscribeInput) -> dict[str, Any]:
-    predictor = _get_predictor()
-    output = predictor.predict(
-        file_string=inp.file_string,
-        file_url=inp.file_url,
-        file=inp.file,
-        num_speakers=inp.num_speakers,
-        translate=inp.translate,
-        language=inp.language,
-        prompt=inp.prompt,
-    )
-    return {
-        "segments": output.segments,
-        "language": output.language,
-        "num_speakers": output.num_speakers,
-        "speakers": output.speakers or {},
-    }
+    with _gpu_semaphore:
+        predictor = _get_predictor()
+        output = predictor.predict(
+            file_string=inp.file_string,
+            file_url=inp.file_url,
+            file=inp.file,
+            num_speakers=inp.num_speakers,
+            translate=inp.translate,
+            language=inp.language,
+            prompt=inp.prompt,
+        )
+        return {
+            "segments": output.segments,
+            "language": output.language,
+            "num_speakers": output.num_speakers,
+            "speakers": output.speakers or {},
+        }
 
 
 def _worker(job_id: str, inp: TranscribeInput) -> None:
