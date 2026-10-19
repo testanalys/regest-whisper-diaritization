@@ -1,7 +1,7 @@
 torch==2.8.0
 torchaudio==2.8.0
 torchcodec==0.7.0
-pyannote.audio==4.0.7
+pyannote-audio==4.0.7
 faster-whisper==1.2.1
 ctranslate2==4.6.3
 numpy==2.2.6
