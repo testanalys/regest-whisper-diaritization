@@ -4,7 +4,9 @@ Forked from [thomasmol/cog-whisper-diarization](https://github.com/thomasmol/cog
 
 ## What this is
 
-A speaker-diarized transcription pipeline combining **faster-whisper large-v3-turbo** and **pyannote 3.1** for speaker detection. Given an audio file or URL it returns a timestamped transcript with per-word and per-segment speaker labels.
+A speaker-diarized transcription pipeline combining **faster-whisper large-v3-turbo** and **pyannote `speaker-diarization-community-1`** (pyannote.audio 4) for speaker detection. Given an audio file or URL it returns a timestamped transcript with per-word and per-segment speaker labels.
+
+Each word takes its speaker from community-1's *exclusive* diarization (one speaker at a time), and a Whisper segment that spans a change of speaker is split there. Each speaker also gets one 256-d voiceprint, stamped `model_version: pyannote-speaker-diarization-community-1`. Voiceprints from the earlier 3.1 model are in a different embedding space and must not be compared with these.
 
 Achieves an approximate cost of: **~$0.27 per hour of audio** on RunPod RTX 4090 Serverless.
 
@@ -18,7 +20,7 @@ The original repo was designed for deployment on Replicate via the Cog framework
 
 - **Cog → RunPod handler migration** — added `handler.py` to wrap the predictor in RunPod's serverless handler protocol, replacing Cog's built-in HTTP server which workers would start but never receive jobs through
 - **HuggingFace authentication** — replaced deprecated `use_auth_token=` argument with `huggingface_hub.login()` at setup time
-- **Dependency pinning** — pinned `pyannote-audio==3.3.1` and `huggingface_hub==0.23.4` to resolve a version conflict between pyannote's internals and newer huggingface_hub releases
+- **Dependency pinning** — `requirements.txt` pins torch 2.8.0 (CUDA 12.8), pyannote.audio 4.0.7, faster-whisper 1.2.1 and ctranslate2 4.6.3. Audio is passed to pyannote preloaded, so torchcodec's FFmpeg decoding is never needed
 
 ---
 
@@ -35,7 +37,8 @@ The original repo was designed for deployment on Replicate via the Cog framework
 
 **1. Fork and configure**
 - Fork this repo
-- Accept pyannote model conditions on HuggingFace for `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`
+- Accept pyannote model conditions on HuggingFace for `pyannote/speaker-diarization-community-1` with the account whose token is in `HUGGING_FACE_HUB_TOKEN`, or the worker fails at startup
+- RunPod workers need an NVIDIA driver that supports CUDA 12.8
 - Add GitHub Actions secrets: `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
 
 **2. Build**
