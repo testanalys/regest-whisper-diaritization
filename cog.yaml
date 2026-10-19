@@ -9,7 +9,7 @@ build:
   system_packages:
     - "ffmpeg"
     - "libmagic1"
-    - "cudnn9-cuda-12"
+    # cuDNN 9 ships in cog's nvidia/cuda *-cudnn base image; installing it again conflicts.
     # - "libgl1-mesa-glx"
     # - "libglib2.0-0"
 
