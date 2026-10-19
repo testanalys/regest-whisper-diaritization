@@ -1,5 +1,5 @@
-# GPU image for Azure Container Apps (CUDA 12 + Python 3.10).
-FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-devel
+# GPU image for Azure Container Apps (CUDA 12.8, cuDNN 9).
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1

@@ -19,6 +19,8 @@ def handler(job):
         "segments": output.segments,
         "language": output.language,
         "num_speakers": output.num_speakers,
+        # Cloud Run generate-documents (regest-process) searches Neon with these
+        # 256-d centroids. Do not drop this field.
         "speakers": output.speakers or {},
     }
 

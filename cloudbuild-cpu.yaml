@@ -1,0 +1,11 @@
+steps:
+- name: gcr.io/cloud-builders/docker
+  args:
+  - build
+  - -f
+  - Dockerfile.cpu
+  - -t
+  - us-central1-docker.pkg.dev/regest-ai/regest/whisper-flow-cpu:fp015
+  - .
+images:
+- us-central1-docker.pkg.dev/regest-ai/regest/whisper-flow-cpu:fp015

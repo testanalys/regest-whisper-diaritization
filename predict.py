@@ -1,9 +1,9 @@
 import base64
-import datetime
 import subprocess
 import os
 import requests
 import time
+import wave
 import torch
 import re
 import numpy as np
@@ -11,13 +11,13 @@ import numpy as np
 from cog import BasePredictor, BaseModel, Input, Path
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from pyannote.audio import Pipeline
-import torchaudio
-from faster_whisper.vad import VadOptions
 from huggingface_hub import login
 
-# pyannote/speaker-diarization-3.1 uses wespeaker embeddings (256-d). Stamped on
-# every centroid so a future diarization-model swap is detectable downstream.
-VOICEPRINT_MODEL = "pyannote-speaker-diarization-3.1"
+DIARIZATION_CHECKPOINT = "pyannote/speaker-diarization-community-1"
+# Stamped on every centroid. Voiceprints from different models live in
+# different embedding spaces and must never be compared; downstream
+# partitions on this string.
+VOICEPRINT_MODEL = "pyannote-speaker-diarization-community-1"
 
 
 class Output(BaseModel):
@@ -26,31 +26,51 @@ class Output(BaseModel):
     num_speakers: int = None
     # Per-speaker voiceprint centroids for the cross-file identity layer:
     #   {SPEAKER_xx: {embedding: [float], dim, model_version, duration_s, segment_count}}
-    # One mean centroid per speaker per file (pyannote return_embeddings=True).
+    # One embedding per speaker per file (community-1 speaker_embeddings).
     # Empty dict when diarization produced no usable embeddings.
     speakers: dict = None
 
 class Predictor(BasePredictor):
     def setup(self):
-        # PERFORMANCE: Enable TF32 for 4090 (Ada Lovelace) hardware acceleration
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        
-        model_name = "large-v3-turbo"
+        device = (os.getenv("WHISPER_DEVICE") or "cuda").strip().lower()
+        if device not in ("cuda", "cpu"):
+            raise ValueError(f"WHISPER_DEVICE must be cuda or cpu, got {device!r}")
+
+        if device == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            compute_type = "int8_float16"
+        else:
+            compute_type = "int8"
+
+        model_name = (os.getenv("WHISPER_MODEL") or "large-v3-turbo").strip()
         model = WhisperModel(
             model_name,
-            device="cuda",
-            compute_type="int8_float16",
+            device=device,
+            compute_type=compute_type,
         )
         self.model = BatchedInferencePipeline(model=model)
-        
-        hf_token = os.getenv('HUGGING_FACE_HUB_TOKEN')
+        self._device = device
+        self._skip_diarization = (os.getenv("SKIP_DIARIZATION") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+        hf_token = os.getenv("HUGGING_FACE_HUB_TOKEN")
         if hf_token:
             login(token=hf_token)
-        
-        self.diarization_model = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1"
-        ).to(torch.device("cuda"))
+
+        self.diarization_model = None
+        if not self._skip_diarization:
+            # Gated on Hugging Face: the token's account must have accepted
+            # the community-1 conditions, or this raises at startup.
+            self.diarization_model = Pipeline.from_pretrained(
+                DIARIZATION_CHECKPOINT, token=hf_token or None
+            )
+            if self.diarization_model is None:
+                raise RuntimeError(f"could not load {DIARIZATION_CHECKPOINT}")
+            self.diarization_model.to(torch.device(device))
 
     def predict(
         self,
@@ -112,86 +132,43 @@ class Predictor(BasePredictor):
         # beam_size=1 is the secret sauce for the Turbo model's speed
         options = dict(
             language=language,
-            beam_size=1, 
+            beam_size=1,
             batch_size=16,
             vad_filter=True,
-            # vad_parameters=VadOptions(
-            #     max_speech_duration_s=30,
-            #     min_speech_duration_ms=100,
-            #     speech_pad_ms=100,
-            #     threshold=0.25,
-            # ),
             word_timestamps=True,
             initial_prompt=prompt,
             task="translate" if translate else "transcribe",
         )
-        
+
         t_start = time.time()
         whisper_segments, info = self.model.transcribe(audio_path, **options)
         whisper_segments = list(whisper_segments)
         t_transcribe = time.time() - t_start
 
-        # DIARIZATION (+ per-speaker voiceprint centroids for cross-file identity)
-        # return_embeddings=True makes pyannote also return one mean embedding per
-        # speaker cluster, aligned (by row) with sorted diarization.labels().
-        waveform, sample_rate = torchaudio.load(audio_path)
-        diarization, speaker_embeddings = self.diarization_model(
-            {"waveform": waveform, "sample_rate": sample_rate},
-            num_speakers=num_speakers,
-            return_embeddings=True,
-        )
-        t_diarize = time.time() - (t_start + t_transcribe)
+        t_diarize = 0.0
+        diarization = None
+        if self.diarization_model is not None:
+            # DIARIZATION (+ per-speaker voiceprint embeddings for cross-file identity).
+            # Audio goes in preloaded, so pyannote never needs torchcodec to decode.
+            diarization = self.diarization_model(
+                {"waveform": _load_wav(audio_path), "sample_rate": 16000},
+                num_speakers=num_speakers,
+            )
+            t_diarize = time.time() - (t_start + t_transcribe)
 
-        # 3. LINEAR MERGE (O(N) Complexity - No Pandas!)
-        # Flatten diarization into a sorted list of speaker turns
+        # 3. WORD-LEVEL SPEAKER ASSIGNMENT
+        # The exclusive diarization has one speaker at any instant, so each word
+        # takes the speaker it overlaps most. A Whisper segment that spans a
+        # change of speaker is split at the change: an interjection ("Mr. Fontes,
+        # your response") stays with the voice that said it.
         diar_turns = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            diar_turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
-        
-        unique_speakers = len(set(d["speaker"] for d in diar_turns))
-        
-        final_segments = []
-        diar_idx = 0
+        if diarization is not None:
+            for turn, _, speaker in diarization.exclusive_speaker_diarization.itertracks(yield_label=True):
+                diar_turns.append((turn.start, turn.end, speaker))
+            diar_turns.sort()
 
-        for s in whisper_segments:
-            seg_start, seg_end = s.start, s.end
-            
-            # Find the best speaker via maximum overlap
-            best_speaker = "UNKNOWN"
-            max_overlap = 0
-            
-            # Fast-forward diarization index to current segment start
-            while diar_idx < len(diar_turns) and diar_turns[diar_idx]["end"] < seg_start:
-                diar_idx += 1
-            
-            # Check all turns that intersect with this segment
-            curr_idx = diar_idx
-            while curr_idx < len(diar_turns) and diar_turns[curr_idx]["start"] < seg_end:
-                overlap = min(seg_end, diar_turns[curr_idx]["end"]) - max(seg_start, diar_turns[curr_idx]["start"])
-                if overlap > max_overlap:
-                    max_overlap = overlap
-                    best_speaker = diar_turns[curr_idx]["speaker"]
-                curr_idx += 1
-
-            # Build words list
-            words_list = []
-            for w in (s.words or []):
-                words_list.append({
-                    "start": float(w.start),
-                    "end": float(w.end),
-                    "word": w.word,
-                    "probability": float(w.probability),
-                    "speaker": best_speaker # Segment-level is usually enough for words
-                })
-
-            final_segments.append({
-                "start": float(seg_start),
-                "end": float(seg_end),
-                "text": s.text.strip(),
-                "speaker": best_speaker,
-                "avg_logprob": float(s.avg_logprob),
-                "words": words_list
-            })
+        unique_speakers = len({t[2] for t in diar_turns}) if diar_turns else 1
+        final_segments = split_by_speaker(whisper_segments, diar_turns)
 
         # 4. SMART GROUPING
         if not final_segments:
@@ -207,68 +184,155 @@ class Predictor(BasePredictor):
             duration = current["end"] - current["start"]
 
             # Merge if same speaker, small gap, and not a full sentence yet
-            if (next_seg["speaker"] == current["speaker"] and 
-                gap <= 1.0 and 
-                duration < 25.0 and 
+            if (next_seg["speaker"] == current["speaker"] and
+                gap <= 1.0 and
+                duration < 25.0 and
                 not re.search(end_punctuation, current["text"])):
-                
+
                 current["end"] = next_seg["end"]
                 current["text"] += " " + next_seg["text"]
                 current["words"].extend(next_seg["words"])
             else:
                 grouped.append(current)
                 current = next_seg
-        
+
         grouped.append(current)
-        
+
         # Cleanup final text strings
         for g in grouped:
             g["text"] = re.sub(r"\s+", " ", g["text"]).strip()
             g["duration"] = g["end"] - g["start"]
 
-        # 5. VOICEPRINT CENTROIDS (one mean embedding per speaker per file)
-        speaker_voiceprints = self._build_speaker_voiceprints(
-            diarization, speaker_embeddings, final_segments
+        # 5. VOICEPRINT CENTROIDS (one embedding per speaker per file)
+        speaker_voiceprints = (
+            build_speaker_voiceprints(diarization, final_segments)
+            if diarization is not None
+            else {}
         )
 
         print(f"Transcribe: {t_transcribe:.2f}s | Diarize: {t_diarize:.2f}s | Total: {time.time()-t_start:.2f}s")
         return grouped, unique_speakers, info.language, speaker_voiceprints
 
-    @staticmethod
-    def _build_speaker_voiceprints(diarization, speaker_embeddings, final_segments):
-        """Map pyannote's per-speaker mean embeddings to a serializable dict.
 
-        pyannote (return_embeddings=True) yields an (n_speakers, dim) array whose
-        rows align with sorted ``diarization.labels()``. Speakers with too little
-        speech can have NaN/empty embeddings; those are skipped so we never store
-        a poisoned centroid. ``duration_s``/``segment_count`` come from the
-        whisper-aligned segments and act as a quality signal downstream.
-        """
-        voiceprints = {}
-        if speaker_embeddings is None:
-            return voiceprints
+def _load_wav(path):
+    """The 16 kHz mono PCM file ffmpeg wrote, as a (1, time) float tensor."""
+    with wave.open(path, "rb") as w:
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    return torch.from_numpy(pcm.astype(np.float32) / 32768.0).unsqueeze(0)
 
-        labels = list(diarization.labels())
-        for idx, label in enumerate(labels):
-            if idx >= len(speaker_embeddings):
-                continue
-            emb = np.asarray(speaker_embeddings[idx], dtype=float)
-            if emb.size == 0 or not np.all(np.isfinite(emb)):
-                # Too little speech to embed reliably -> degrade to text-only.
-                continue
-            voiceprints[label] = {
-                "embedding": [float(x) for x in emb.tolist()],
-                "dim": int(emb.shape[-1]),
-                "model_version": VOICEPRINT_MODEL,
-                "duration_s": 0.0,
-                "segment_count": 0,
-            }
 
-        for seg in final_segments:
-            sp = seg.get("speaker")
-            vp = voiceprints.get(sp)
-            if vp is not None:
-                vp["duration_s"] += float(seg.get("end", 0.0)) - float(seg.get("start", 0.0))
-                vp["segment_count"] += 1
+def speaker_at(turns, start, end, cursor=0):
+    """The speaker of [start, end] in sorted, non-overlapping turns.
 
+    Most overlap wins. A zero-length word, or one that falls in a gap between
+    turns, takes the turn containing or nearest to its midpoint. Returns
+    (speaker, cursor) so a caller walking forward in time keeps the search
+    linear.
+    """
+    while cursor < len(turns) and turns[cursor][1] < start:
+        cursor += 1
+    best, best_overlap = None, 0.0
+    i = cursor
+    while i < len(turns) and turns[i][0] < end:
+        overlap = min(end, turns[i][1]) - max(start, turns[i][0])
+        if overlap > best_overlap:
+            best, best_overlap = turns[i][2], overlap
+        i += 1
+    if best is None:
+        mid = (start + end) / 2
+        near = turns[max(cursor - 1, 0):cursor + 1]
+        if near:
+            best = min(near, key=lambda t: max(t[0] - mid, mid - t[1], 0.0))[2]
+    return best, cursor
+
+
+def split_by_speaker(whisper_segments, turns):
+    """Whisper segments re-cut so every output segment has one speaker.
+
+    Each word takes its own speaker from the diarization turns; consecutive
+    words of one speaker form a segment. Without diarization everything is
+    SPEAKER_00.
+    """
+    out = []
+    cursor = 0
+    for s in whisper_segments:
+        words = list(s.words or [])
+        if not words:
+            speaker = speaker_at(turns, float(s.start), float(s.end), cursor)[0] if turns else None
+            out.append({
+                "start": float(s.start),
+                "end": float(s.end),
+                "text": s.text.strip(),
+                "speaker": speaker or "SPEAKER_00",
+                "avg_logprob": float(s.avg_logprob),
+                "words": [],
+            })
+            continue
+
+        run = []
+        for w in words:
+            speaker = "SPEAKER_00"
+            if turns:
+                speaker, cursor = speaker_at(turns, float(w.start), float(w.end), cursor)
+            if run and run[-1]["speaker"] != speaker:
+                out.append(_segment_from_words(run, s))
+                run = []
+            run.append({
+                "start": float(w.start),
+                "end": float(w.end),
+                "word": w.word,
+                "probability": float(w.probability),
+                "speaker": speaker,
+            })
+        out.append(_segment_from_words(run, s))
+    return out
+
+
+def _segment_from_words(words, whisper_segment):
+    return {
+        "start": words[0]["start"],
+        "end": words[-1]["end"],
+        "text": "".join(w["word"] for w in words).strip(),
+        "speaker": words[0]["speaker"],
+        "avg_logprob": float(whisper_segment.avg_logprob),
+        "words": words,
+    }
+
+
+def build_speaker_voiceprints(diarization, final_segments):
+    """Map community-1's per-speaker embeddings to a serializable dict.
+
+    ``speaker_embeddings`` is a (n_speakers, dim) array whose rows align with
+    ``speaker_diarization.labels()``. Speakers with too little speech can have
+    NaN embeddings; those are skipped so we never store a poisoned centroid.
+    ``duration_s``/``segment_count`` come from the word-aligned segments and
+    act as a quality signal downstream.
+    """
+    voiceprints = {}
+    embeddings = diarization.speaker_embeddings
+    if embeddings is None:
         return voiceprints
+
+    labels = list(diarization.speaker_diarization.labels())
+    for idx, label in enumerate(labels):
+        if idx >= len(embeddings):
+            continue
+        emb = np.asarray(embeddings[idx], dtype=float)
+        if emb.size == 0 or not np.all(np.isfinite(emb)):
+            # Too little speech to embed reliably -> degrade to text-only.
+            continue
+        voiceprints[label] = {
+            "embedding": [float(x) for x in emb.tolist()],
+            "dim": int(emb.shape[-1]),
+            "model_version": VOICEPRINT_MODEL,
+            "duration_s": 0.0,
+            "segment_count": 0,
+        }
+
+    for seg in final_segments:
+        vp = voiceprints.get(seg.get("speaker"))
+        if vp is not None:
+            vp["duration_s"] += float(seg.get("end", 0.0)) - float(seg.get("start", 0.0))
+            vp["segment_count"] += 1
+
+    return voiceprints
