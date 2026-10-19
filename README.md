@@ -20,7 +20,7 @@ The original repo was designed for deployment on Replicate via the Cog framework
 
 - **Cog → RunPod handler migration** — added `handler.py` to wrap the predictor in RunPod's serverless handler protocol, replacing Cog's built-in HTTP server which workers would start but never receive jobs through
 - **HuggingFace authentication** — replaced deprecated `use_auth_token=` argument with `huggingface_hub.login()` at setup time
-- **Dependency pinning** — `requirements.txt` pins torch 2.8.0 (CUDA 12.8), pyannote.audio 4.0.7, faster-whisper 1.2.1 and ctranslate2 4.6.3. Audio is passed to pyannote preloaded, so torchcodec's FFmpeg decoding is never needed
+- **Dependency pinning** — `requirements.txt` pins torch 2.8.0 (cog base image: CUDA 12.9 with cuDNN 9), pyannote.audio 4.0.7, faster-whisper 1.2.1 and ctranslate2 4.6.3. Audio is passed to pyannote preloaded, so torchcodec's FFmpeg decoding is never needed
 
 ---
 
@@ -38,7 +38,7 @@ The original repo was designed for deployment on Replicate via the Cog framework
 **1. Fork and configure**
 - Fork this repo
 - Accept pyannote model conditions on HuggingFace for `pyannote/speaker-diarization-community-1` with the account whose token is in `HUGGING_FACE_HUB_TOKEN`, or the worker fails at startup
-- RunPod workers need an NVIDIA driver that supports CUDA 12.8
+- RunPod workers need an NVIDIA driver that supports CUDA 12.9 (restrict the endpoint's allowed CUDA versions)
 - Add GitHub Actions secrets: `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
 
 **2. Build**
